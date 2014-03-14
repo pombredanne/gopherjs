@@ -142,7 +142,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		}
 
 	case *ast.FuncLit:
-		params, body := c.translateFunction(e.Type, exprType.(*types.Signature), e.Body.List)
+		params, body := c.translateFunction(e.Type, exprType.(*types.Signature), e.Body.List, false)
 		if len(c.escapingVars) != 0 {
 			list := strings.Join(c.escapingVars, ", ")
 			return c.formatExpr("(function(%s) { return function(%s) {\n%s%s}; })(%s)", list, strings.Join(params, ", "), string(body), strings.Repeat("\t", c.p.indentation), list)
@@ -563,9 +563,11 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 		}
 
 		var fun *expression
+		var obj types.Object
 		switch f := plainFun.(type) {
 		case *ast.Ident:
-			if o, ok := c.p.info.Uses[f].(*types.Builtin); ok {
+			obj = c.p.info.Uses[f]
+			if o, ok := obj.(*types.Builtin); ok {
 				switch o.Name() {
 				case "new":
 					t := c.p.info.Types[e].Type.(*types.Pointer)
@@ -660,7 +662,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 
 		case *ast.SelectorExpr:
 			sel := c.p.info.Selections[f]
-			o := sel.Obj()
+			obj = sel.Obj()
 
 			externalizeExpr := func(e ast.Expr) string {
 				t := c.p.info.Types[e].Type
@@ -683,7 +685,7 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 					c.p.dependencies[sel.Obj()] = true
 				}
 
-				methodName := o.Name()
+				methodName := obj.Name()
 				if reservedKeywords[methodName] {
 					methodName += "$"
 				}
@@ -699,8 +701,8 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 					t = s.Field(index).Type()
 				}
 
-				if o.Pkg() != nil && o.Pkg().Path() == "github.com/gopherjs/gopherjs/js" {
-					switch o.Name() {
+				if obj.Pkg() != nil && obj.Pkg().Path() == "github.com/gopherjs/gopherjs/js" {
+					switch obj.Name() {
 					case "Get":
 						if id, ok := c.identifierConstant(e.Args[0]); ok {
 							return c.formatExpr("%s.%s", fun, id)
@@ -755,11 +757,11 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 					case "IsNull":
 						return c.formatParenExpr("%s === null", fun)
 					default:
-						panic("Invalid js package object: " + o.Name())
+						panic("Invalid js package object: " + obj.Name())
 					}
 				}
 
-				methodsRecvType := o.Type().(*types.Signature).Recv().Type()
+				methodsRecvType := obj.Type().(*types.Signature).Recv().Type()
 				_, pointerExpected := methodsRecvType.(*types.Pointer)
 				_, isPointer := t.Underlying().(*types.Pointer)
 				_, isStruct := t.Underlying().(*types.Struct)
@@ -808,7 +810,20 @@ func (c *funcContext) translateExpr(expr ast.Expr) *expression {
 				return c.formatExpr("(%s = %e, %s(%s))", tupleVar, e.Args[0], fun, strings.Join(c.translateArgs(sig, args, false), ", "))
 			}
 		}
-		return c.formatExpr("%s(%s)", fun, strings.Join(c.translateArgs(sig, e.Args, e.Ellipsis.IsValid()), ", "))
+		args := c.translateArgs(sig, e.Args, e.Ellipsis.IsValid())
+		if obj != nil && obj.Pkg() != nil && ((obj.Pkg().Path() == "time" && obj.Name() == "Sleep") || (obj.Pkg().Path() == "main" && obj.Name() == "a")) {
+			callbackCase := c.caseCounter
+			c.caseCounter++
+			returnVar := ""
+			assign := ""
+			if obj.Type().(*types.Signature).Results().Len() != 0 {
+				returnVar = c.newVariable("r")
+				assign = " " + returnVar + " = go$r;"
+			}
+			c.PrintCond(false, fmt.Sprintf("%s(%s);", fun, strings.Join(args, ", ")), fmt.Sprintf("go$s = %d; go$r = %s(%s); if(go$r === GO$BLK) return; case %d:%s", callbackCase, fun, strings.Join(append(args, "go$f"), ", "), callbackCase, assign))
+			return c.formatExpr("%s", returnVar)
+		}
+		return c.formatExpr("%s(%s)", fun, strings.Join(args, ", "))
 
 	case *ast.StarExpr:
 		if c1, isCall := e.X.(*ast.CallExpr); isCall && len(c1.Args) == 1 {

@@ -304,7 +304,7 @@ func (t *Translator) TranslatePackage(importPath string, files []*ast.File, file
 					Tok: token.DEFINE,
 					Rhs: []ast.Expr{init.Rhs},
 				},
-			})
+			}, false)
 		})
 		if len(init.Lhs) == 1 {
 			v := hasCallVisitor{c.p.info, false}
@@ -331,7 +331,7 @@ func (t *Translator) TranslatePackage(importPath string, files []*ast.File, file
 	// init functions
 	var init Decl
 	init.DceDeps = collectDependencies(nil, func() {
-		init.InitCode = c.translateFunctionBody(1, initStmts)
+		init.InitCode = c.translateFunctionBody(1, initStmts, false)
 	})
 	archive.Declarations = append(archive.Declarations, init)
 
@@ -491,7 +491,11 @@ func (c *funcContext) translateToplevelFunction(fun *ast.FuncDecl, native string
 				},
 			}, stmts...)
 		}
-		params, body := c.translateFunction(fun.Type, sig, stmts)
+		blocking := o.Pkg().Path() == "main"
+		params, body := c.translateFunction(fun.Type, sig, stmts, blocking)
+		if blocking {
+			params = append(params, "go$c")
+		}
 		joinedParams = strings.Join(params, ", ")
 		return []byte(fmt.Sprintf("\t%s = function(%s) {\n%s\t};\n", lhs, joinedParams, string(body)))
 	}
@@ -549,7 +553,7 @@ func (c *funcContext) translateToplevelFunction(fun *ast.FuncDecl, native string
 	return code.Bytes()
 }
 
-func (c *funcContext) translateFunction(t *ast.FuncType, sig *types.Signature, stmts []ast.Stmt) (params []string, body []byte) {
+func (c *funcContext) translateFunction(t *ast.FuncType, sig *types.Signature, stmts []ast.Stmt, blocking bool) (params []string, body []byte) {
 	vars := make(map[string]int, len(c.allVars))
 	for k, v := range c.allVars {
 		vars[k] = v
@@ -574,11 +578,11 @@ func (c *funcContext) translateFunction(t *ast.FuncType, sig *types.Signature, s
 		}
 	}
 
-	body = newFuncContext.translateFunctionBody(1, stmts)
+	body = newFuncContext.translateFunctionBody(1, stmts, blocking)
 	return
 }
 
-func (c *funcContext) translateFunctionBody(indent int, stmts []ast.Stmt) []byte {
+func (c *funcContext) translateFunctionBody(indent int, stmts []ast.Stmt, blocking bool) []byte {
 	v := gotoVisitor{c: c}
 	for _, stmt := range stmts {
 		ast.Walk(&v, stmt)
@@ -607,9 +611,13 @@ func (c *funcContext) translateFunctionBody(indent int, stmts []ast.Stmt) []byte
 
 		printBody := func() {
 			if c.flattened {
-				c.Printf("/* */ var go$s = 0, go$f = function() { while (true) { switch (go$s) { case 0:")
+				c.Printf("/* */ var go$s = 0, go$f = function(go$r) { while (true) { switch (go$s) { case 0:")
 				c.translateStmtList(stmts)
-				c.Printf("/* */ } break; } }; return go$f();")
+				callbackCall := ""
+				if blocking {
+					callbackCall = "go$c(); "
+				}
+				c.Printf("/* */ } break; } %s}; go$f(); return GO$BLK;", callbackCall)
 				return
 			}
 			c.translateStmtList(stmts)
@@ -700,6 +708,25 @@ func (v *gotoVisitor) Visit(node ast.Node) (w ast.Visitor) {
 				v.c.caseCounter++
 			}
 			return nil
+		}
+	case *ast.CallExpr:
+		switch f := n.Fun.(type) {
+		case *ast.Ident:
+			o := v.c.p.info.Uses[f]
+			if o != nil && o.Pkg() != nil && o.Pkg().Path() == "main" && o.Name() == "a" {
+				v.c.flattened = true
+				for _, n2 := range v.stack {
+					v.c.hasGoto[n2] = true
+				}
+			}
+		case *ast.SelectorExpr:
+			o := v.c.p.info.Selections[f].Obj()
+			if o.Pkg() != nil && o.Pkg().Path() == "time" && o.Name() == "Sleep" {
+				v.c.flattened = true
+				for _, n2 := range v.stack {
+					v.c.hasGoto[n2] = true
+				}
+			}
 		}
 	case ast.Expr:
 		return nil

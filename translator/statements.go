@@ -460,10 +460,6 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 			Rhs: []ast.Expr{one},
 		}, label)
 
-	case *ast.ExprStmt:
-		c.printLabel(label)
-		c.Printf("%s;", c.translateExpr(s.X).String())
-
 	case *ast.DeclStmt:
 		c.printLabel(label)
 		decl := s.Decl.(*ast.GenDecl)
@@ -497,6 +493,13 @@ func (c *funcContext) translateStmt(stmt ast.Stmt, label string) {
 			}
 		case token.CONST:
 			// skip, constants are inlined
+		}
+
+	case *ast.ExprStmt:
+		c.printLabel(label)
+		expr := c.translateExpr(s.X).String()
+		if expr != "" {
+			c.Printf("%s;", expr)
 		}
 
 	case *ast.LabeledStmt:
